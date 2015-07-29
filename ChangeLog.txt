@@ -1,3 +1,6 @@
+Version 0.8:
+    Introduced authenticator and authorizator implementations.
+
 Version 0.7:
     Fix issue #38, added aligned to MQTT 3.1.1
     Refactored big event switch to @Annotation dispatcher
@@ -10,6 +13,18 @@ Version 0.7:
     Added store path variable "persistent_store" to configuration file (picked from Steven Warwick fork)
     Removed OSGi bundle, developer time burner
     Fixed github issue #30, returning error on mapdb file not deleted that corrupt reiterated builds
+    Added handling of allow_anonymous clients (as in mosquitto issue #34)
+    Modified the password_file format to use password stored in sha256 and not plain text
+    Added ACL file for topic read|write operations.
+    Removed cause of leakage of Netty Sessions (fix issue #39)
+    Cleaned Netty's stuff reference from Events used in Disruptor (fix issue #40)
+    Bad assignment of PacketID during publish to subscribed QoS0 topics (fix issue #38)
+    Fixed duplicated subscription with different QoS same client and topic (fix issue #49)
+    Fixed UNSUBSCRIBE that missed to remove the subscription from the persistent store (fix issue #50)
+    Fixed issue on multiple publish for overlapping subscription by the same client (fix issue #52).
+    Moved the authorization check before dropping an already connected client with same clientID (fix issue #44).
+    Fixed subscription tree that was unable to update clean session flag on subs with same client, topic and qos (fix issue #55)
+    Fixed overwriting of published qos in forward publish loop (fix issue #56)
 
 Version 0.6:
     Fix issue #42, bad password file path composition

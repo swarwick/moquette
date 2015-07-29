@@ -28,6 +28,7 @@ import org.eclipse.moquette.spi.IMatchingCondition;
 import org.eclipse.moquette.spi.IMessagesStore;
 import org.eclipse.moquette.spi.ISessionsStore;
 import org.eclipse.moquette.spi.impl.events.*;
+import org.eclipse.moquette.spi.impl.security.IAuthorizator;
 import org.eclipse.moquette.spi.impl.subscriptions.Subscription;
 import org.eclipse.moquette.spi.impl.subscriptions.SubscriptionsStore;
 import static org.eclipse.moquette.parser.netty.Utils.VERSION_3_1;
@@ -47,7 +48,7 @@ import org.eclipse.moquette.proto.messages.SubscribeMessage;
 import org.eclipse.moquette.proto.messages.UnsubAckMessage;
 import org.eclipse.moquette.proto.messages.UnsubscribeMessage;
 import org.eclipse.moquette.server.ConnectionDescriptor;
-import org.eclipse.moquette.server.IAuthenticator;
+import org.eclipse.moquette.spi.impl.security.IAuthenticator;
 import org.eclipse.moquette.server.ServerChannel;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -97,6 +98,8 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
     
     private Map<String, ConnectionDescriptor> m_clientIDs = new HashMap<>();
     private SubscriptionsStore subscriptions;
+    private boolean allowAnonymous;
+    private IAuthorizator m_authorizator;
     private IMessagesStore m_messagesStore;
     private ISessionsStore m_sessionsStore;
     private IAuthenticator m_authenticator;
@@ -114,13 +117,18 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
      * @param storageService the persistent store to use for save/load of messages
      *  for QoS1 and QoS2 handling.
      * @param sessionsStore the clients sessions store, used to persist subscriptions.
-     * @param authenticator the authenticator used in connect messages
+     * @param authenticator the authenticator used in connect messages.
+     * @param allowAnonymous true connection to clients without credentials.
+     * @param authorizator used to apply ACL policies to publishes and subscriptions.
      */
-    void init(SubscriptionsStore subscriptions, IMessagesStore storageService, 
-            ISessionsStore sessionsStore,
-            IAuthenticator authenticator) {
+    void init(SubscriptionsStore subscriptions, IMessagesStore storageService,
+              ISessionsStore sessionsStore,
+              IAuthenticator authenticator,
+              boolean allowAnonymous, IAuthorizator authorizator) {
         //m_clientIDs = clientIDs;
         this.subscriptions = subscriptions;
+        this.allowAnonymous = allowAnonymous;
+        m_authorizator = authorizator;
         LOG.debug("subscription tree on init {}", subscriptions.dumpTree());
         m_authenticator = authenticator;
         m_messagesStore = storageService;
@@ -153,6 +161,25 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
             ConnAckMessage okResp = new ConnAckMessage();
             okResp.setReturnCode(ConnAckMessage.IDENTIFIER_REJECTED);
             session.write(okResp);
+            return;
+        }
+
+        //handle user authentication
+        if (msg.isUserFlag()) {
+            String pwd = null;
+            if (msg.isPasswordFlag()) {
+                pwd = msg.getPassword();
+            } else if (!this.allowAnonymous) {
+                failedCredentials(session);
+                return;
+            }
+            if (!m_authenticator.checkValid(msg.getUsername(), pwd)) {
+                failedCredentials(session);
+                return;
+            }
+            session.setAttribute(NettyChannel.ATTR_KEY_USERNAME, msg.getUsername());
+        } else if (!this.allowAnonymous) {
+            failedCredentials(session);
             return;
         }
 
@@ -194,20 +221,6 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
             m_willStore.put(msg.getClientID(), will);
         }
 
-        //handle user authentication
-        if (msg.isUserFlag()) {
-            String pwd = null;
-            if (msg.isPasswordFlag()) {
-                pwd = msg.getPassword();
-            }
-            if (!m_authenticator.checkValid(msg.getUsername(), pwd)) {
-                ConnAckMessage okResp = new ConnAckMessage();
-                okResp.setReturnCode(ConnAckMessage.BAD_USERNAME_OR_PASSWORD);
-                session.write(okResp);
-                return;
-            }
-        }
-
         subscriptions.activate(msg.getClientID());
 
         //handle clean session flag
@@ -225,12 +238,19 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
         session.write(okResp);
 
         LOG.info("Create persistent session for clientID <{}>", msg.getClientID());
-        m_sessionsStore.addNewSubscription(Subscription.createEmptySubscription(msg.getClientID(), true), msg.getClientID()); //null means EmptySubscription
+        m_sessionsStore.addNewSubscription(Subscription.createEmptySubscription(msg.getClientID(), true)); //null means EmptySubscription
         LOG.info("Connected client ID <{}> with clean session {}", msg.getClientID(), msg.isCleanSession());
         if (!msg.isCleanSession()) {
             //force the republish of stored QoS1 and QoS2
             republishStoredInSession(msg.getClientID());
         }
+    }
+
+    private void failedCredentials(ServerChannel session) {
+        ConnAckMessage okResp = new ConnAckMessage();
+        okResp.setReturnCode(ConnAckMessage.BAD_USERNAME_OR_PASSWORD);
+        session.write(okResp);
+        session.close(false);
     }
 
     /**
@@ -272,36 +292,41 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
     
     @MQTTMessage(message = PublishMessage.class)
     void processPublish(ServerChannel session, PublishMessage msg) {
-        LOG.trace("PUB --PUBLISH--> SRV processPublish invoked with {}", msg);
+        LOG.trace("PUB --PUBLISH--> SRV executePublish invoked with {}", msg);
         String clientID = (String) session.getAttribute(NettyChannel.ATTR_KEY_CLIENTID);
+        final String topic = msg.getTopicName();
+        //check if the topic can be wrote
+        String user = (String) session.getAttribute(NettyChannel.ATTR_KEY_USERNAME);
+        if (m_authorizator.canWrite(topic, user, clientID)) {
+            executePublish(clientID, msg);
+        } else {
+            LOG.debug("topic {} doesn't have write credentials", topic);
+        }
+    }
+        
+    private void executePublish(String clientID, PublishMessage msg) {
         final String topic = msg.getTopicName();
         final AbstractMessage.QOSType qos = msg.getQos();
         final ByteBuffer message = msg.getPayload();
         boolean retain = msg.isRetainFlag();
-        processPublish(clientID, topic, qos, message, retain, msg.getMessageID());
-    }
-        
-    private void processPublish(String clientID, String topic, QOSType qos, ByteBuffer message, boolean retain, Integer messageID) { 
+        final Integer messageID = msg.getMessageID();
         LOG.info("PUBLISH from clientID <{}> on topic <{}> with QoS {}", clientID, topic, qos);
 
+        PublishEvent publishEvt = new PublishEvent(clientID, msg);
         if (qos == AbstractMessage.QOSType.MOST_ONE) { //QoS0
-            forward2Subscribers(topic, qos, message, retain, messageID);
-        } else if (qos == AbstractMessage.QOSType.LEAST_ONE) {
-            PublishEvent inFlightEvt = new PublishEvent(topic, qos, message, retain,
-                        clientID, messageID);
+            forward2Subscribers(publishEvt);
+        } else if (qos == AbstractMessage.QOSType.LEAST_ONE) { //QoS1
             //TODO use a message store for TO PUBLISH MESSAGES it has nothing to do with inFlight!!
-            m_messagesStore.addInFlight(inFlightEvt, clientID, messageID);
-            forward2Subscribers(topic, qos, message, retain, messageID);
+            m_messagesStore.addInFlight(publishEvt, clientID, messageID);
+            forward2Subscribers(publishEvt);
             m_messagesStore.cleanInFlight(clientID, messageID);
             //NB the PUB_ACK could be sent also after the addInFlight
             sendPubAck(new PubAckEvent(messageID, clientID));
             LOG.debug("replying with PubAck to MSG ID {}", messageID);
-        }  else if (qos == AbstractMessage.QOSType.EXACTLY_ONCE) {
+        }  else if (qos == AbstractMessage.QOSType.EXACTLY_ONCE) { //QoS2
             String publishKey = String.format("%s%d", clientID, messageID);
             //store the message in temp store
-            PublishEvent qos2Persistent = new PublishEvent(topic, qos, message, retain,
-                        clientID, messageID);
-            m_messagesStore.persistQoS2Message(publishKey, qos2Persistent);
+            m_messagesStore.persistQoS2Message(publishKey, publishEvt);
             sendPubRec(clientID, messageID);
             //Next the client will send us a pub rel
             //NB publish to subscribers for QoS 2 happen upon PUBREL from publisher
@@ -322,35 +347,38 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
      */
     private void forwardPublishWill(WillMessage will, String clientID) {
         //it has just to publish the message downstream to the subscribers
-        final String topic = will.getTopic();
-        final AbstractMessage.QOSType qos = will.getQos();
-        final ByteBuffer message = will.getPayload();
-        boolean retain = will.isRetained();
         //NB it's a will publish, it needs a PacketIdentifier for this conn, default to 1
-        if (qos == AbstractMessage.QOSType.MOST_ONE) {
-            forward2Subscribers(topic, qos, message, retain, null);
-        } else {
-            int messageId = m_messagesStore.nextPacketID(clientID);
-            forward2Subscribers(topic, qos, message, retain, messageId);
+        Integer messageId = null;
+        if (will.getQos() != AbstractMessage.QOSType.MOST_ONE) {
+            messageId = m_messagesStore.nextPacketID(clientID);
         }
 
+        PublishEvent pub = new PublishEvent(will.getTopic(), will.getQos(), will.getPayload(), will.isRetained(),
+                clientID, messageId);
+        forward2Subscribers(pub);
     }
-    
+
+
     /**
      * Flood the subscribers with the message to notify. MessageID is optional and should only used for QoS 1 and 2
      * */
-    private void forward2Subscribers(String topic, AbstractMessage.QOSType qos, ByteBuffer origMessage,
-                                     boolean retain, Integer messageID) {
+    void forward2Subscribers(PublishEvent pubEvt) {
+        final String topic = pubEvt.getTopic();
+        final AbstractMessage.QOSType publishingQos = pubEvt.getQos();
+        final ByteBuffer origMessage = pubEvt.getMessage();
+        boolean retain = pubEvt.isRetain();
+        final Integer messageID = pubEvt.getMessageID();
         LOG.debug("forward2Subscribers republishing to existing subscribers that matches the topic {}", topic);
         if (LOG.isDebugEnabled()) {
             LOG.debug("content <{}>", DebugUtils.payload2Str(origMessage));
             LOG.debug("subscription tree {}", subscriptions.dumpTree());
         }
         for (final Subscription sub : subscriptions.matches(topic)) {
+            AbstractMessage.QOSType qos = publishingQos;
             if (qos.ordinal() > sub.getRequestedQos().ordinal()) {
                 qos = sub.getRequestedQos();
             }
-            
+
             LOG.debug("Broker republishing to client <{}> topic <{}> qos <{}>, active {}",
                     sub.getClientId(), sub.getTopicFilter(), qos, sub.isActive());
             ByteBuffer message = origMessage.duplicate();
@@ -382,7 +410,7 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
         }
     }
 
-    private void sendPublish(String clientId, String topic, AbstractMessage.QOSType qos, ByteBuffer message, boolean retained, Integer messageID) {
+    protected void sendPublish(String clientId, String topic, AbstractMessage.QOSType qos, ByteBuffer message, boolean retained, Integer messageID) {
         LOG.debug("sendPublish invoked clientId <{}> on topic <{}> QoS {} retained {} messageID {}", clientId, topic, qos, retained, messageID);
         PublishMessage pubMessage = new PublishMessage();
         pubMessage.setRetainFlag(retained);
@@ -410,9 +438,16 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
         if (m_clientIDs.get(clientId) == null) {
             throw new RuntimeException(String.format("Can't find a ConnectionDescriptor for client <%s> in cache <%s>", clientId, m_clientIDs));
         }
-        LOG.debug("Session for clientId {} is {}", clientId, m_clientIDs.get(clientId).getSession());
-//        m_clientIDs.get(clientId).getSession().write(pubMessage);
-        disruptorPublish(new OutputMessagingEvent(m_clientIDs.get(clientId).getSession(), pubMessage));
+        ServerChannel session = m_clientIDs.get(clientId).getSession();
+        LOG.debug("Session for clientId {} is {}", clientId, session);
+
+        String user = (String) session.getAttribute(NettyChannel.ATTR_KEY_USERNAME);
+        if (!m_authorizator.canRead(topic, user, clientId)) {
+            LOG.debug("topic {} doesn't have read credentials", topic);
+            return;
+        }
+
+        disruptorPublish(new OutputMessagingEvent(session, pubMessage));
     }
     
     private void sendPubRec(String clientID, int messageID) {
@@ -459,15 +494,12 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
         LOG.debug("PUB --PUBREL--> SRV processPubRel invoked for clientID {} ad messageID {}", clientID, messageID);
         String publishKey = String.format("%s%d", clientID, messageID);
         PublishEvent evt = m_messagesStore.retrieveQoS2Message(publishKey);
-
-        final String topic = evt.getTopic();
-        final AbstractMessage.QOSType qos = evt.getQos();
-
-        forward2Subscribers(topic, qos, evt.getMessage(), evt.isRetain(), evt.getMessageID());
-
+        forward2Subscribers(evt);
         m_messagesStore.removeQoS2Message(publishKey);
 
         if (evt.isRetain()) {
+            final String topic = evt.getTopic();
+            final AbstractMessage.QOSType qos = evt.getQos();
             m_messagesStore.storeRetained(topic, evt.getMessage(), qos);
         }
 
@@ -529,13 +561,6 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
     
     void processConnectionLost(LostConnectionEvent evt) {
         String clientID = evt.clientID;
-        if (m_clientIDs.containsKey(clientID)) {
-            if (!m_clientIDs.get(clientID).getSession().equals(evt.session)) {
-                LOG.info("Received a lost connection with client <{}> for a not matching session", clientID);
-                return;
-            }
-        }
-
         //If already removed a disconnect message was already processed for this clientID
         if (m_clientIDs.remove(clientID) != null) {
 
@@ -564,7 +589,9 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
 
         for (String topic : topics) {
             subscriptions.removeSubscription(topic, clientID);
+            m_sessionsStore.removeSubscription(topic, clientID);
         }
+
         //ack the client
         UnsubAckMessage ackMessage = new UnsubAckMessage();
         ackMessage.setMessageID(messageID);
@@ -579,38 +606,37 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
         boolean cleanSession = (Boolean) session.getAttribute(NettyChannel.ATTR_KEY_CLEANSESSION);
         LOG.debug("SUBSCRIBE client <{}> packetID {}", clientID, msg.getMessageID());
 
-        for (SubscribeMessage.Couple req : msg.subscriptions()) {
-            AbstractMessage.QOSType qos = AbstractMessage.QOSType.values()[req.getQos()];
-            Subscription newSubscription = new Subscription(clientID, req.getTopicFilter(), qos, cleanSession);
-            subscribeSingleTopic(newSubscription, req.getTopicFilter());
-        }
-
         //ack the client
         SubAckMessage ackMessage = new SubAckMessage();
         ackMessage.setMessageID(msg.getMessageID());
 
-        //reply with requested qos
-        for(SubscribeMessage.Couple req : msg.subscriptions()) {
+        for (SubscribeMessage.Couple req : msg.subscriptions()) {
             AbstractMessage.QOSType qos = AbstractMessage.QOSType.values()[req.getQos()];
-            ackMessage.addType(qos);
+            Subscription newSubscription = new Subscription(clientID, req.getTopicFilter(), qos, cleanSession);
+            boolean valid = subscribeSingleTopic(newSubscription, req.getTopicFilter());
+            ackMessage.addType(valid ? qos : AbstractMessage.QOSType.FAILURE);
         }
-        
+
         LOG.debug("SUBACK for packetID {}", msg.getMessageID());
         session.write(ackMessage);
     }
     
-    private void subscribeSingleTopic(Subscription newSubscription, final String topic) {
+    private boolean subscribeSingleTopic(Subscription newSubscription, final String topic) {
         LOG.info("<{}> subscribed to topic <{}> with QoS {}", 
                 newSubscription.getClientId(), topic, 
                 AbstractMessage.QOSType.formatQoS(newSubscription.getRequestedQos()));
-        String clientID = newSubscription.getClientId();
-        m_sessionsStore.addNewSubscription(newSubscription, clientID);
+        boolean validTopic = SubscriptionsStore.validate(newSubscription);
+        if (!validTopic) {
+            //send SUBACK with 0x80 for this topic filter
+            return false;
+        }
+        m_sessionsStore.addNewSubscription(newSubscription);
         subscriptions.add(newSubscription);
 
         //scans retained messages to be published to the new subscription
         Collection<IMessagesStore.StoredMessage> messages = m_messagesStore.searchMatching(new IMatchingCondition() {
             public boolean match(String key) {
-                return  SubscriptionsStore.matchTopics(key, topic);
+                return SubscriptionsStore.matchTopics(key, topic);
             }
         });
 
@@ -622,6 +648,7 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
                     m_messagesStore.nextPacketID(newSubscription.getClientId());
             sendPublish(newSubscription.getClientId(), storedMsg.getTopic(), storedMsg.getQos(), storedMsg.getPayload(), true, packetID);
         }
+        return true;
     }
     
     private void disruptorPublish(OutputMessagingEvent msgEvent) {
@@ -635,11 +662,15 @@ class ProtocolProcessor implements EventHandler<ValueEvent> {
     }
 
     public void onEvent(ValueEvent t, long l, boolean bln) throws Exception {
-        MessagingEvent evt = t.getEvent();
-        //It's always of type OutputMessagingEvent
-        OutputMessagingEvent outEvent = (OutputMessagingEvent) evt;
-        LOG.debug("Output event, sending {}", outEvent.getMessage());
-        outEvent.getChannel().write(outEvent.getMessage());
+        try {
+            MessagingEvent evt = t.getEvent();
+            //It's always of type OutputMessagingEvent
+            OutputMessagingEvent outEvent = (OutputMessagingEvent) evt;
+            LOG.debug("Output event, sending {}", outEvent.getMessage());
+            outEvent.getChannel().write(outEvent.getMessage());
+        } finally {
+            t.setEvent(null); //free the reference to all Netty stuff
+        }
     }
 
 }

@@ -30,8 +30,21 @@ import org.slf4j.LoggerFactory;
  */
 public class SubscriptionsStore {
 
+    /**
+     * Check if the topic filter of the subscription is well formed
+     * */
+    public static boolean validate(Subscription newSubscription) {
+        try {
+            parseTopic(newSubscription.topicFilter);
+            return true;
+        } catch (ParseException pex) {
+            LOG.info("Bad matching topic filter <{}>", newSubscription.topicFilter);
+            return false;
+        }
+    }
+
     public static interface IVisitor<T> {
-        void visit(TreeNode node);
+        void visit(TreeNode node, int deep);
         
         T getResult();
     }
@@ -40,13 +53,23 @@ public class SubscriptionsStore {
         
         String s = "";
 
-        public void visit(TreeNode node) {
+        public void visit(TreeNode node, int deep) {
             String subScriptionsStr = "";
+            String indentTabs = indentTabs(deep);
             for (Subscription sub : node.m_subscriptions) {
-                subScriptionsStr += sub.toString();
+                subScriptionsStr += indentTabs + sub.toString() + "\n";
             }
             s += node.getToken() == null ? "" : node.getToken().toString();
-            s += subScriptionsStr + "\n";
+            s +=  "\n" + (node.m_subscriptions.isEmpty() ? indentTabs : "") + subScriptionsStr /*+ "\n"*/;
+        }
+
+        private String indentTabs(int deep) {
+            String s = "";
+            for (int i=0; i < deep; i++) {
+                s += "\t";
+//                s += "--";
+            }
+            return s;
         }
         
         public String getResult() {
@@ -58,7 +81,7 @@ public class SubscriptionsStore {
         
         private List<Subscription> m_allSubscriptions = new ArrayList<Subscription>();
 
-        public void visit(TreeNode node) {
+        public void visit(TreeNode node, int deep) {
             m_allSubscriptions.addAll(node.subscriptions());
         }
         
@@ -98,7 +121,7 @@ public class SubscriptionsStore {
     }
     
     private TreeNode findMatchingNode(String topic) {
-        List<Token> tokens = new ArrayList<Token>();
+        List<Token> tokens = new ArrayList<>();
         try {
             tokens = parseTopic(topic);
         } catch (ParseException ex) {
@@ -156,7 +179,7 @@ public class SubscriptionsStore {
      */
     public void clearAllSubscriptions() {
         SubscriptionTreeCollector subsCollector = new SubscriptionTreeCollector();
-        bfsVisit(subscriptions, subsCollector);
+        bfsVisit(subscriptions, subsCollector, 0);
         
         List<Subscription> allSubscriptions = subsCollector.getResult();
         for (Subscription subscription : allSubscriptions) {
@@ -203,10 +226,20 @@ public class SubscriptionsStore {
             return Collections.emptyList();
         }
 
-        Queue<Token> tokenQueue = new LinkedBlockingDeque<Token>(tokens);
-        List<Subscription> matchingSubs = new ArrayList<Subscription>();
+        Queue<Token> tokenQueue = new LinkedBlockingDeque<>(tokens);
+        List<Subscription> matchingSubs = new ArrayList<>();
         subscriptions.matches(tokenQueue, matchingSubs);
-        return matchingSubs;
+
+        //remove the overlapping subscriptions, selecting ones with greatest qos
+        Map<String, Subscription> subsForClient = new HashMap<>();
+        for (Subscription sub : matchingSubs) {
+            Subscription existingSub = subsForClient.get(sub.getClientId());
+            //update the selected subscriptions if not present or if has a greater qos
+            if (existingSub == null || existingSub.getRequestedQos().ordinal() < sub.getRequestedQos().ordinal()) {
+                subsForClient.put(sub.getClientId(), sub);
+            }
+        }
+        return /*matchingSubs*/new ArrayList<>(subsForClient.values());
     }
 
     public boolean contains(Subscription sub) {
@@ -219,17 +252,17 @@ public class SubscriptionsStore {
     
     public String dumpTree() {
         DumpTreeVisitor visitor = new DumpTreeVisitor();
-        bfsVisit(subscriptions, visitor);
+        bfsVisit(subscriptions, visitor, 0);
         return visitor.getResult();
     }
     
-    private void bfsVisit(TreeNode node, IVisitor visitor) {
+    private void bfsVisit(TreeNode node, IVisitor visitor, int deep) {
         if (node == null) {
             return;
         }
-        visitor.visit(node);
+        visitor.visit(node, deep);
         for (TreeNode child : node.m_children) {
-            bfsVisit(child, visitor);
+            bfsVisit(child, visitor, ++deep);
         }
     }
     

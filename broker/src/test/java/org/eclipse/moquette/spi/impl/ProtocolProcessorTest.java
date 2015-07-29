@@ -25,8 +25,8 @@ import org.eclipse.moquette.server.netty.NettyChannel;
 import org.eclipse.moquette.spi.IMatchingCondition;
 import org.eclipse.moquette.spi.IMessagesStore;
 import org.eclipse.moquette.spi.ISessionsStore;
-import org.eclipse.moquette.spi.impl.events.LostConnectionEvent;
 import org.eclipse.moquette.spi.impl.events.PublishEvent;
+import org.eclipse.moquette.spi.impl.security.PermitAllAuthorizator;
 import org.eclipse.moquette.spi.impl.subscriptions.Subscription;
 import org.eclipse.moquette.spi.impl.subscriptions.SubscriptionsStore;
 import static org.eclipse.moquette.parser.netty.Utils.VERSION_3_1_1;
@@ -38,7 +38,6 @@ import org.eclipse.moquette.proto.messages.DisconnectMessage;
 import org.eclipse.moquette.proto.messages.PublishMessage;
 import org.eclipse.moquette.proto.messages.SubAckMessage;
 import org.eclipse.moquette.proto.messages.SubscribeMessage;
-import org.eclipse.moquette.server.Constants;
 import org.eclipse.moquette.server.ServerChannel;
 import static org.junit.Assert.*;
 import org.junit.Before;
@@ -54,11 +53,14 @@ public class ProtocolProcessorTest {
     final static String FAKE_CLIENT_ID2 = "FAKE_456";
     final static String FAKE_PUBLISHER_ID = "Publisher";
     final static String FAKE_TOPIC = "/news";
+    final static String BAD_FORMATTED_TOPIC = "#MQTTClient";
     
     final static String TEST_USER = "fakeuser";
     final static String TEST_PWD = "fakepwd";
+    final static String EVIL_TEST_USER = "eviluser";
+    final static String EVIL_TEST_PWD = "unsecret";
     
-    ServerChannel m_session;
+    DummyChannel m_session;
     byte m_returnCode;
     ConnectMessage connMsg;
     ProtocolProcessor m_processor;
@@ -70,8 +72,10 @@ public class ProtocolProcessorTest {
     MockAuthenticator m_mockAuthenticator;
     
     class DummyChannel implements ServerChannel {
+
+        private boolean m_channelClosed = false;
         
-        private Map<Object, Object> m_attributes = new HashMap<Object, Object>();
+        private Map<Object, Object> m_attributes = new HashMap<>();
 
         public Object getAttribute(AttributeKey<Object> key) {
             return m_attributes.get(key);
@@ -85,7 +89,11 @@ public class ProtocolProcessorTest {
         }
 
         public void close(boolean immediately) {
-            
+            m_channelClosed = true;
+        }
+
+        boolean isClosed() {
+            return this.m_channelClosed;
         }
 
         public void write(Object value) {
@@ -99,7 +107,7 @@ public class ProtocolProcessorTest {
                 throw new AssertionError("Wrong return code");
             }
         }
-    } 
+    }
     
     /**
      * This a synchronous channel that avoid output ring buffer from Processor
@@ -107,7 +115,7 @@ public class ProtocolProcessorTest {
     class MockReceiverChannel implements ServerChannel {
 //        byte m_returnCode;
         AbstractMessage m_receivedMessage;
-        private Map<Object, Object> m_attributes = new HashMap<Object, Object>();
+        private Map<Object, Object> m_attributes = new HashMap<>();
 
         public Object getAttribute(AttributeKey<Object> key) {
             return m_attributes.get(key);
@@ -141,7 +149,7 @@ public class ProtocolProcessorTest {
                 throw new AssertionError("Wrong return code");
             }
         }
-    } 
+    }
     
     @Before
     public void setUp() throws InterruptedException {
@@ -157,14 +165,14 @@ public class ProtocolProcessorTest {
         m_sessionStore = memStorage;
         //m_storageService.initStore();
         
-        Map<String, String> users = new HashMap<String, String>();
+        Map<String, String> users = new HashMap<>();
         users.put(TEST_USER, TEST_PWD);
         m_mockAuthenticator = new MockAuthenticator(users);
 
         subscriptions = new SubscriptionsStore();
         subscriptions.init(new MemoryStorageService());
         m_processor = new ProtocolProcessor();
-        m_processor.init(subscriptions, m_storageService, m_sessionStore, m_mockAuthenticator);
+        m_processor.init(subscriptions, m_storageService, m_sessionStore, m_mockAuthenticator, true, new PermitAllAuthorizator());
     }
     
     @Test
@@ -207,7 +215,7 @@ public class ProtocolProcessorTest {
         /*verify(mockedMessaging).publish(eq("topic"), eq("Topic message".getBytes()),
                 any(AbstractMessage.QOSType.class), anyBoolean(), eq("123"), any(IoSession.class));*/
     }
-    
+
     @Test
     public void validAuthentication() {
         connMsg.setClientID("123");
@@ -251,8 +259,78 @@ public class ProtocolProcessorTest {
         //Verify
         assertEquals(ConnAckMessage.BAD_USERNAME_OR_PASSWORD, m_returnCode);
     }
-    
-    
+
+    @Test
+    public void prohibitAnonymousClient() {
+        connMsg.setClientID("123");
+        m_processor.init(subscriptions, m_storageService, m_sessionStore, m_mockAuthenticator, false, new PermitAllAuthorizator());
+
+        //Exercise
+        m_processor.processConnect(m_session, connMsg);
+
+        //Verify
+        assertEquals(ConnAckMessage.BAD_USERNAME_OR_PASSWORD, m_returnCode);
+    }
+
+    @Test
+    public void prohibitAnonymousClient_providingUsername() {
+        connMsg.setClientID("123");
+        connMsg.setUserFlag(true);
+        connMsg.setUsername(TEST_USER + "_fake");
+        m_processor.init(subscriptions, m_storageService, m_sessionStore, m_mockAuthenticator, false, new PermitAllAuthorizator());
+
+        //Exercise
+        m_processor.processConnect(m_session, connMsg);
+
+        //Verify
+        assertEquals(ConnAckMessage.BAD_USERNAME_OR_PASSWORD, m_returnCode);
+    }
+
+    @Test
+    public void acceptAnonymousClient() {
+        connMsg.setClientID("123");
+        m_processor.init(subscriptions, m_storageService, m_sessionStore, m_mockAuthenticator, true, new PermitAllAuthorizator());
+
+        //Exercise
+        m_processor.processConnect(m_session, connMsg);
+
+        //Verify
+        assertEquals(ConnAckMessage.CONNECTION_ACCEPTED, m_returnCode);
+    }
+
+    @Test
+    public void connectWithSameClientIDBadCredentialsDoesntDropExistingClient() {
+        //Connect a client1
+        connMsg.setClientID("Client1");
+        connMsg.setUserFlag(true);
+        connMsg.setPasswordFlag(true);
+        connMsg.setUsername(TEST_USER);
+        connMsg.setPassword(TEST_PWD);
+        m_processor.processConnect(m_session, connMsg);
+        assertEquals(ConnAckMessage.CONNECTION_ACCEPTED, m_returnCode);
+
+        //create another connect same clientID but with bad credentials
+        ConnectMessage evilClientConnMsg = new ConnectMessage();
+        evilClientConnMsg.setProcotolVersion((byte) 0x03);
+        evilClientConnMsg.setClientID("Client1");
+        evilClientConnMsg.setUserFlag(true);
+        evilClientConnMsg.setPasswordFlag(true);
+        evilClientConnMsg.setUsername(EVIL_TEST_USER);
+        evilClientConnMsg.setPassword(EVIL_TEST_PWD);
+        DummyChannel evilSession = new DummyChannel();
+
+        //Exercise
+        m_processor.processConnect(evilSession, evilClientConnMsg);
+
+        //Verify
+        //the evil client gets a not auth notification
+        assertEquals(ConnAckMessage.BAD_USERNAME_OR_PASSWORD, m_returnCode);
+        //the good client remains connected
+        assertFalse(m_session.isClosed());
+        assertTrue(evilSession.isClosed());
+    }
+
+
     @Test
     public void testConnAckContainsSessionPresentFlag() throws InterruptedException {
         connMsg = new ConnectMessage();
@@ -298,7 +376,7 @@ public class ProtocolProcessorTest {
         
         //simulate a connect that register a clientID to an IoSession
         subs.init(new MemoryStorageService());
-        m_processor.init(subs, m_storageService, m_sessionStore, null);
+        m_processor.init(subs, m_storageService, m_sessionStore, null, true, new PermitAllAuthorizator());
         ConnectMessage connectMessage = new ConnectMessage();
         connectMessage.setProcotolVersion((byte)3);
         connectMessage.setClientID(FAKE_CLIENT_ID);
@@ -342,7 +420,7 @@ public class ProtocolProcessorTest {
         
         //simulate a connect that register a clientID to an IoSession
         subs.init(new MemoryStorageService());
-        m_processor.init(subs, m_storageService, m_sessionStore, null);
+        m_processor.init(subs, m_storageService, m_sessionStore, null, true, new PermitAllAuthorizator());
         
         MockReceiverChannel firstReceiverSession = new MockReceiverChannel();
         ConnectMessage connectMessage = new ConnectMessage();
@@ -418,6 +496,27 @@ public class ProtocolProcessorTest {
         assertTrue(subscriptions.contains(expectedSubscription));
     }
 
+
+    @Test
+    public void testSubscribeWithBadFormattedTopic() {
+        SubscribeMessage msg = new SubscribeMessage();
+        msg.addSubscription(new SubscribeMessage.Couple((byte)AbstractMessage.QOSType.MOST_ONE.ordinal(), BAD_FORMATTED_TOPIC));
+        m_session.setAttribute(NettyChannel.ATTR_KEY_CLIENTID, FAKE_CLIENT_ID);
+        m_session.setAttribute(NettyChannel.ATTR_KEY_CLEANSESSION, false);
+        subscriptions.clearAllSubscriptions();
+        assertEquals(0, subscriptions.size());
+
+        //Exercise
+        m_processor.processSubscribe(m_session, msg);
+
+        //Verify
+        assertEquals(0, subscriptions.size());
+        assertTrue(m_receivedMessage instanceof SubAckMessage);
+        List<QOSType> qosSubAcked = ((SubAckMessage) m_receivedMessage).types();
+        assertEquals(1, qosSubAcked.size());
+        assertEquals(QOSType.FAILURE, qosSubAcked.get(0));
+    }
+
     
     @Test
     public void testPublishOfRetainedMessage_afterNewSubscription() throws Exception {
@@ -460,7 +559,7 @@ public class ProtocolProcessorTest {
         subs.init(new MemoryStorageService());
         
         //simulate a connect that register a clientID to an IoSession
-        m_processor.init(subs, m_storageService, m_sessionStore, null);
+        m_processor.init(subs, m_storageService, m_sessionStore, null, true, new PermitAllAuthorizator());
         ConnectMessage connectMessage = new ConnectMessage();
         connectMessage.setClientID(FAKE_PUBLISHER_ID);
         connectMessage.setProcotolVersion((byte)3);
@@ -499,7 +598,7 @@ public class ProtocolProcessorTest {
                 ByteBuffer.wrap("Hello".getBytes()), true, FAKE_PUBLISHER_ID, 120);
         m_storageService.storePublishForFuture(retainedMessage);
 
-        m_processor.init(subs, m_storageService, m_sessionStore, null);
+        m_processor.init(subs, m_storageService, m_sessionStore, null, true, new PermitAllAuthorizator());
         ConnectMessage connectMessage = new ConnectMessage();
         connectMessage.setClientID(FAKE_PUBLISHER_ID);
         connectMessage.setProcotolVersion((byte)3);
@@ -518,7 +617,7 @@ public class ProtocolProcessorTest {
         List<Subscription> inactiveSubscriptions = Arrays.asList(inactiveSub);
         when(mockedSubscriptions.matches(eq("/topic"))).thenReturn(inactiveSubscriptions);
         m_processor = new ProtocolProcessor();
-        m_processor.init(mockedSubscriptions, m_storageService, m_sessionStore, null);
+        m_processor.init(mockedSubscriptions, m_storageService, m_sessionStore, null, true, new PermitAllAuthorizator());
         
         //Exercise
         ByteBuffer buffer = ByteBuffer.allocate(5).put("Hello".getBytes());
@@ -543,7 +642,7 @@ public class ProtocolProcessorTest {
         List<Subscription> inactiveSubscriptions = Arrays.asList(inactiveSub);
         when(mockedSubscriptions.matches(eq("/topic"))).thenReturn(inactiveSubscriptions);
         m_processor = new ProtocolProcessor();
-        m_processor.init(mockedSubscriptions, m_storageService, m_sessionStore, null);
+        m_processor.init(mockedSubscriptions, m_storageService, m_sessionStore, null, true, new PermitAllAuthorizator());
         
         //Exercise
         ByteBuffer buffer = ByteBuffer.allocate(5).put("Hello".getBytes());
@@ -597,44 +696,38 @@ public class ProtocolProcessorTest {
         assertTrue(messages.isEmpty());
     }
 
+    List<PublishEvent> publishedForwarded = new ArrayList<>();
 
-    /**
-     * Simulate a client1 (FAKE_CLIENT_ID) bound with session1, an event of connection lost
-     * for client2 (FAKE_CLIENT_ID, same of the client1) but from another session, verify
-     * the session of client1 is not closed.
-     * */
     @Test
-    public void testConnectionLostClosesTheCorrectSession() {
-        MockReceiverChannel channel1 = new MockReceiverChannel();
+    public void testForwardPublishWithCorrectQos() {
+        ByteBuffer payload = ByteBuffer.wrap("Hello world MQTT!!".getBytes());
+        PublishEvent forwardPublish = new PublishEvent("a/b", QOSType.EXACTLY_ONCE, payload, true, "Publisher", 1);
+        IMessagesStore memoryMessageStore = new MemoryStorageService();
 
-        //init the processor
-        /*SubscriptionsStore subs = new SubscriptionsStore();
-        subs.init(new MemoryStorageService());*/
-        SubscriptionsStore subs = mock(SubscriptionsStore.class);
-        m_processor.init(subs, m_storageService, m_sessionStore, null);
+        Subscription subQos1 = new Subscription("Sub A", "a/b", QOSType.LEAST_ONE, false);
+        Subscription subQos2 = new Subscription("Sub B", "a/+", QOSType.EXACTLY_ONCE, false);
+        SubscriptionsStore subscriptions = new SubscriptionsStore();
+        subscriptions.add(subQos1);
+        subscriptions.add(subQos2);
 
-        //simulate a connect from client1 FAKE_CLIENT_ID from channel1
-        ConnectMessage connectMessage = new ConnectMessage();
-        connectMessage.setProcotolVersion((byte) 3);
-        connectMessage.setClientID(FAKE_CLIENT_ID);
-        m_processor.processConnect(channel1, connectMessage);
-        assertConnectReturnCode(ConnAckMessage.CONNECTION_ACCEPTED, channel1);
-        //ConnAck received
 
-        //send a connection lost event from an already disconnected client, but with same clientID (FAKE_CLIENT_ID)
+        ProtocolProcessor processor = new ProtocolProcessor() {
+            @Override
+            protected void sendPublish(String clientId, String topic, AbstractMessage.QOSType qos, ByteBuffer message,
+                                       boolean retained, Integer messageID) {
+                publishedForwarded.add(new PublishEvent(topic, qos, message, retained, clientId, messageID));
+            }
+        };
+        processor.init(subscriptions, memoryMessageStore, null, null, true, null);
+
         //Exercise
-        DummyChannel channel2 = new DummyChannel();
-        LostConnectionEvent lostConnectionEvent = new LostConnectionEvent(channel2, FAKE_CLIENT_ID);
-        m_processor.processConnectionLost(lostConnectionEvent);
+        processor.forward2Subscribers(forwardPublish);
 
-        //Verify no subscriptions were deactivated for the client on session1
-        verify(subs, never()).deactivate(anyString());
-    }
-
-    private void assertConnectReturnCode(byte expectedReturnCode, MockReceiverChannel receiverSession) {
-        AbstractMessage recvMsg = receiverSession.getMessage();
-        assertTrue(recvMsg instanceof ConnAckMessage);
-        ConnAckMessage connAckMsg = (ConnAckMessage) recvMsg;
-        assertEquals(expectedReturnCode, connAckMsg.getReturnCode());
+        //Verify
+        assertEquals(2, publishedForwarded.size());
+        assertEquals(subQos1.getClientId(), publishedForwarded.get(0).getClientID());
+        assertEquals(subQos1.getRequestedQos(), publishedForwarded.get(0).getQos());
+        assertEquals(subQos2.getClientId(), publishedForwarded.get(1).getClientID());
+        assertEquals(subQos2.getRequestedQos(), publishedForwarded.get(1).getQos());
     }
 }

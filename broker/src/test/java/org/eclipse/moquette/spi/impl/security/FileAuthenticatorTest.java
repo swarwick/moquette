@@ -13,11 +13,12 @@
  *
  * You may elect to redistribute this code under either of these licenses.
  */
-package org.eclipse.moquette.spi.impl;
+package org.eclipse.moquette.spi.impl.security;
 
-import org.eclipse.moquette.server.IAuthenticator;
 import org.junit.Test;
-import static org.junit.Assert.*;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 /**
  *
@@ -47,5 +48,5 @@ public class FileAuthenticatorTest {
         
         assertFalse(auth.checkValid("testuser2", "passwd"));
     }
-    
+
 }
